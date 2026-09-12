@@ -1,0 +1,1390 @@
+================================================================================
+ 코어-위성 오버나이트 트레이딩 시스템 상세 설계서
+================================================================================
+ 문서 ID   : QT-SDD-001
+ 버전      : 1.0
+ 작성일    : 2026-09-12
+ 상태      : 구현 착수 가능 (Coding-Ready)
+ 대상 독자 : 본 문서만으로 코드를 작성해야 하는 개발자
+ 선행 문서 : 키움 영웅전 우승자 기법 조사 및 3문턱 검증
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ 0. 문서 사용 규칙과 전제
+--------------------------------------------------------------------------------
+
+본 문서는 코드를 포함하지 않되, 모든 상수, 수식, 스키마, 메서드 시그니처,
+에러 코드를 확정값으로 명시한다.
+
+  [TBD]    : 백테스트로 결정할 파라미터
+  [VERIFY] : 구현 첫날 실환경에서 반드시 확인해야 하는 항목
+
+전제 환경
+
+  - Windows 10/11 64-bit 단일 호스트
+  - 대신증권 계좌 및 CYBOS Plus 사용 신청 완료 (데이터 전용, 주문 미사용)
+  - 키움증권 계좌 및 REST API 앱키 발급 완료 (주문 및 실시간 체결 전용)
+
+데이터 소스와 주문 채널을 서로 다른 증권사로 이원화하는 것이 본 설계의 핵심
+구조이며, 이로 인해 발생하는 정합성 리스크는 4.6절에서 별도로 다룬다.
+
+
+--------------------------------------------------------------------------------
+ 1. 설계 목표와 수락 기준 (Acceptance Gate)
+--------------------------------------------------------------------------------
+
+백테스트 리포트가 아래 게이트를 통과하지 못하면 실자금 투입 단계로 넘어가지
+않는다.
+
+  ID   문턱          지표                              통과 기준
+  ---- ------------- --------------------------------- ---------------------
+  G1   수익/안정성   Sharpe (비용 반영 후, 연율)       >= 1.0
+  G2   수익/안정성   MDD                               <= 15%
+  G3   수익/안정성   거래당 평균 총수익                >= 왕복비용 x 1.5
+  G4   수익/안정성   비용 2배 스트레스 시 CAGR         > 0
+  G5   수익/안정성   Risk of Ruin (부트스트랩 10000회) < 1%   (-50% 도달)
+  G6   구현가능성    신호 -> 주문 허용 지연            >= 1000 ms
+  G7   구현가능성    Creon 시세 요청 사용률 (피크)     <= 한도의 70%
+  G8   구현가능성    단일 주문 수량 / 당일 거래대금    <= 0.5%
+  G9   구현가능성    재량 개입 거래 비중               <= 20%
+  G10  시장대응성    레짐별(G/A/R) 각 구간 MDD         <= 20%
+  G11  시장대응성    워크포워드 OOS / IS 성과비        >= 0.6
+  G12  시장대응성    일일 주문 취소율                  <= 30%
+
+
+--------------------------------------------------------------------------------
+ 2. 전체 아키텍처
+--------------------------------------------------------------------------------
+
+2.1 프로세스 구성
+-----------------
+
+시스템은 4개의 독립 OS 프로세스로 구성되며, 프로세스 경계가 곧 비트수 경계이자
+장애 격리 경계이다.
+
+  +--------------------------------------------------------------------------+
+  |  P1 : creon_server.exe   (Python 3.11 32-bit, 관리자 권한)               |
+  |  - CYBOS Plus COM (cpsysdib.dll / CpUtil.dll / CpTrade.dll)              |
+  |  - 단일 STA 스레드 + 우선순위 큐 + Rate Governor                         |
+  |  - ZMQ ROUTER   tcp://127.0.0.1:5561   (RPC)                             |
+  |  - ZMQ PUB      tcp://127.0.0.1:5562   (실시간 스트림)                   |
+  +--------------------------------------------------------------------------+
+              ^  msgpack RPC                |  msgpack PUB
+              |                             v
+  +--------------------------------------------------------------------------+
+  |  P2 : quant_core.exe     (Python 3.12 64-bit)                            |
+  |  - DataHub / Regime / CoreStrategy / SatelliteStrategy                   |
+  |  - RiskOverlay (hard lock) / OrderRouter / Journal                       |
+  |  - DuckDB + Parquet 데이터레이크                                         |
+  +--------------------------------------------------------------------------+
+              |  HTTPS REST + WebSocket
+              v
+  +--------------------------------------------------------------------------+
+  |  P3 : kiwoom_gw.exe      (Python 3.12 64-bit)                            |
+  |  - 키움 REST 주문 (kt10000/01/02/03) + 실시간 (0B 체결 / 0D 호가)        |
+  |  - 토큰 관리, 유량 리미터, 주문 상태기계                                 |
+  +--------------------------------------------------------------------------+
+
+  +--------------------------------------------------------------------------+
+  |  P4 : ops_ui.exe         (64-bit, Streamlit)                             |
+  |  - 위성 신호 승인 UI, 포지션/손익 모니터, 킬스위치                       |
+  +--------------------------------------------------------------------------+
+
+
+2.2 비트수 브리지 방식 선정 근거
+--------------------------------
+
+32비트 COM을 64비트에서 쓰는 방법은 세 가지가 있다.
+
+  (a) COM+ 대리자 등록
+  (b) msl-loadlib 류의 DLL 브리지
+  (c) 별도 프로세스 + IPC
+
+본 설계는 (c) 별도 프로세스 + ZeroMQ IPC 를 채택한다. 근거는 다음과 같다.
+
+  1) CYBOS Plus 는 DLL 함수 호출이 아니라 이벤트를 발생시키는 COM 자동화
+     객체이고 메시지 펌프가 필요하므로 DLL 브리지 계열이 부적합하다.
+  2) Creon 세션은 하루 1회 로그인 후 장시간 유지해야 하는 상태 보유형
+     자원이므로, 짧은 수명의 호출 브리지보다 상주 서버가 자연스럽다.
+  3) 프로세스 분리는 COM 크래시가 전략 엔진을 죽이지 않게 하는 격리 효과를
+     제공한다.
+
+
+2.3 대용량 payload 처리 - pyarrow 회피 결정
+-------------------------------------------
+
+[중요 제약]
+  pyarrow 는 최근 버전에서 Windows 32-bit 휠을 제공하지 않는다.
+  따라서 P1(32-bit) 에서는 Parquet / Feather 직렬화를 절대 시도하지 않는다.
+
+  - P1 은 numpy 와 msgpack 만 사용해 원시 배열을 청크 단위로 스트리밍한다.
+  - Parquet 변환과 DuckDB 적재는 전부 P2(64-bit) 에서 수행한다.
+  - pandas 도 32-bit 측에서는 사용하지 않고 순수 list / dict 로 처리한다.
+  - 이 결정을 어기면 구현 중반에 반드시 막힌다.
+
+청크 규칙
+
+  - 단일 RPC 응답은 8 MB 를 넘지 않는다.
+  - 초과 시 stream=true 응답 후 동일 req_id 로 seq=0..N 의 다중 프레임을
+    PUB 이 아닌 RPC 소켓으로 연속 송신하고, 마지막 프레임에 last=true 를 표기.
+  - 일봉 전체 덤프(약 2900종목 x 250봉 x 8컬럼, 약 46MB)는 종목 200개 단위로
+    분할 송신한다.
+
+
+--------------------------------------------------------------------------------
+ 3. P1 - Creon 32-bit 데이터 서버 상세 설계
+--------------------------------------------------------------------------------
+
+3.1 실행 환경 사양
+------------------
+
+  - Python 3.11 32-bit        (3.12 는 pywin32 호환 [VERIFY])
+  - 허용 패키지 : pywin32, pyzmq, msgpack, numpy  (이외 금지)
+  - 관리자 권한 실행 필수      (COM 등록 접근)
+  - Windows 작업 스케줄러에 08:00 기동 트리거 등록
+  - Creon 은 매일 재로그인 필요. 자동 로그인 스크립트가 선행 실행되어야 함
+    (CpStart.exe 계열 커맨드라인 인자 방식 - 정확한 인자 형식은 설치본
+     버전에 따라 다름 [VERIFY])
+
+로그인 성공 판정
+
+  CpUtil.CpCybos.IsConnect  == 1     AND
+  CpUtil.CpCybos.ServerType == 1     (cybosplus 서버)
+
+  ServerType == 2 (HTS 보통서버) 이면 Plus 기능이 제한되므로 기동 실패로
+  처리한다.
+
+
+3.2 COM 스레딩 모델
+-------------------
+
+COM 객체는 단일 스레드에서만 생성 및 사용한다. 해당 스레드 진입 시
+pythoncom.CoInitialize() 를 호출하고, 메인 루프는 아래 형태로 고정한다.
+
+    loop (10ms tick):
+        pythoncom.PumpWaitingMessages()      # 실시간 이벤트 수신용
+        if not cybos.IsConnect:
+            enter RECONNECT state
+        job = priority_queue.pop_if_budget_available()
+        if job:
+            execute_blocking(job)
+            reply(job)
+
+시세 조회는 Request() + 이벤트가 아니라 BlockRequest() (동기) 만 사용한다.
+이벤트 방식은 메시지 펌프와 큐 처리가 뒤엉켜 디버깅 난이도가 급증하며, 본
+시스템의 지연 예산(>= 1초)에서는 동기 호출로 충분하다.
+실시간 구독(StockCur) 만 예외적으로 이벤트 기반이며, 수신 즉시 PUB 소켓으로
+밀어낸다.
+
+
+3.3 Rate Governor (최우선 구현 모듈)
+------------------------------------
+
+CYBOS Plus 시세 요청은 15초당 60건으로 제한된다 (대신증권 공식 안내).
+초과 시 요청이 지연/차단되고, 심한 경우 세션 재시작이 필요하다.
+거버너는 이중 방어로 구성한다.
+
+  1차 방어 : 서버 측 잔량 조회
+      매 요청 직전 CpUtil.CpCybos.GetLimitRemainCount(limitType) 호출.
+
+        limitType 값
+          LT_TRADE_REQUEST    = 0    (주문 관련 RQ)
+          LT_NONTRADE_REQUEST = 1    (시세 관련 RQ)   <-- 본 시스템 사용
+          LT_SUBSCRIBE        = 2    (시세 관련 SB)
+
+      잔량이 SAFETY_MARGIN(=8) 이하이면 LimitRequestRemainTime (밀리초) 을
+      읽어 그 값 + 100ms 대기.
+
+  2차 방어 : 클라이언트 측 슬라이딩 윈도
+      최근 15000ms 내 자체 요청 타임스탬프를 deque 에 보관하고
+      52건 (= 60 의 87%) 을 상한으로 둔다.
+
+  두 방어 중 더 보수적인 쪽을 따른다.
+  G7 게이트(피크 사용률 70%)는 이 카운터로 측정한다.
+
+우선순위 (정수 prio, 낮을수록 우선)
+
+  prio = 0 : 장중 실시간 전략 조회 (코어 15:10 스캔, 위성 스캔)
+  prio = 3 : 당일 보조 조회
+  prio = 9 : 야간 백필
+
+  prio <= 3 인 작업이 큐에 하나라도 존재하면 prio = 9 작업은 실행하지 않고
+  양보한다. 백필 작업은 종목 단위로 쪼개어 큐에 넣어 선점 가능하게 만든다.
+
+
+3.4 RPC 프로토콜 명세
+---------------------
+
+전송 : ZeroMQ ROUTER(서버) / DEALER(클라이언트)
+직렬 : msgpack
+
+요청 프레임
+
+    {
+      "id":          "uuid4 문자열",
+      "method":      "quote.marketeye",
+      "params":      { ... },
+      "prio":        0,
+      "deadline_ms": 3000,
+      "ts":          1757650000123
+    }
+
+응답 프레임
+
+    {
+      "id":   "동일 uuid",
+      "ok":   true,
+      "data": { ... },                              # ok = true
+      "err":  {"code": "E_RATE", "msg": "..."},     # ok = false
+      "meta": {"remain": 41, "elapsed_ms": 120,
+               "stream": false, "seq": 0, "last": true}
+    }
+
+에러 코드 표
+
+  코드            의미                          클라이언트 처리
+  --------------- ----------------------------- ----------------------------
+  E_DISCONNECT    IsConnect == 0                재시도 금지. 레짐 RED 강제
+                                                전환 후 알림
+  E_RATE          거버너가 deadline 내           지수 백오프 재시도
+                  슬롯 확보 실패                (최대 3회)
+  E_BADPARAM      종목 200 초과, 필드 64 초과    즉시 실패. 버그로 기록
+  E_COM           COM 예외 (HRESULT 포함)        1회 재시도 후 세션 재시작
+  E_EMPTY         수신개수 0                     정상 처리(거래정지 등).
+                                                빈 결과 기록
+  E_TIMEOUT       deadline 초과                  상위 전략은 해당 사이클 스킵
+
+
+3.5 메서드 카탈로그
+-------------------
+
+  method              params                          prio  비용(요청 건수)
+  ------------------- ------------------------------- ----- ----------------
+  health.status       -                                  0   0
+  universe.list       markets:[1,2], with_attrs:true     3   0
+  quote.marketeye     codes:[str], fields:[int]          0   ceil(len/200)
+  chart.daily         code, count | from/to, adjusted    9   1
+  chart.minute        code, period, count | from/to      9   ceil(bars/2499)
+  chart.bulk          codes:[str], kind:"D"|"m"          9   종목별 합산
+  rt.subscribe        codes:[str]                        0   구독 한도 소모
+  rt.unsubscribe      codes:[str]                        0   -
+  admin.reload        -                                  0   0
+  admin.shutdown      -                                  0   0
+
+  반환값
+    health.status   : is_connect, server_type, remain_quote, remain_order,
+                      remain_sub, limit_reset_ms
+    universe.list   : 종목코드 + 속성 테이블
+    quote.marketeye : 2차원 배열
+    chart.daily     : 일봉 배열
+    chart.minute    : 분봉 배열
+    chart.bulk      : 스트리밍
+    rt.subscribe    : 구독 수락 목록
+
+  [핵심] universe.list 는 CpUtil.CpCodeMgr 만 사용하므로 요청 건수를
+  소모하지 않는다. 이 특성이 포인트인타임 유니버스를 매일 무료로 스냅샷할
+  수 있게 해주며, 생존편향 제거의 기반이 된다.
+
+
+3.6 MarketEye 어댑터 상세
+-------------------------
+
+CpSysDib.MarketEye 는 한 번에 최대 200종목, 최대 64필드를 반환한다.
+
+  입력 타입
+    0 : 필드 배열
+    1 : 종목코드 배열
+    2 : 체결비교방식 ('1' 체결가비교 = 기본)
+
+  헤더
+    0 : 필드 개수
+    1 : 필드명 배열
+    2 : 종목 개수
+
+  데이터 접근
+    GetDataValue(필드index, 종목index)
+
+  [결정적 주의사항]
+    반환 데이터의 필드 순서는 요청한 필드 번호의 오름차순으로 정렬된다.
+    요청 배열의 순서가 아니다.
+    따라서 어댑터는 요청 필드를 sorted() 한 뒤 {field_no: index} 맵을
+    만들어 접근해야 한다. 이 규칙을 놓치면 값이 조용히 섞이는 최악의
+    버그가 발생한다.
+
+본 시스템이 사용하는 필드 집합 (27개, 64 한도 내)
+
+  필드      의미                       용도
+  --------- -------------------------- -----------------------------------
+  0         종목코드 (string)          키
+  2         대비부호 (char)            3번과 필수 동반 요청
+  3         전일대비                   등락률 산출
+  4         현재가                     종가 / 현재가
+  5 / 6 / 7 시가 / 고가 / 저가         RP, 윗꼬리, 갭
+  10        거래량                     유동성
+  11        거래대금 (원)              VR, adv20
+  12        장구분 (0장전/1동시/2장중) 15:10 스캔 시 상태 검증
+  13 / 14   총매도 / 총매수 호가잔량   호가 불균형
+  15 / 16   최우선 매도 / 매수 잔량    위성 신호
+  20        총상장주식수               시가총액 산출
+  22 / 23   전일거래량 / 전일종가      갭, 등락률
+  24        체결강도                   위성 등급 판정
+  28 / 31   예상체결가 / 예상체결수량  코어 진입 지정가 산출 (핵심)
+  33 / 34   상한가 / 하한가            상한가 근접 배제
+  35        매매수량단위               주문 수량 정규화
+  36/37/38  시간외단일 부호/대비/현재  불개미 금지규칙 (전일 시간외 급등)
+  63 / 64   52주 최고 / 최저           위치 판정 보조
+  116/118/  프로그램 / 외국인 /        보조 스코어
+  120       기관 순매수
+
+전 종목 (KOSPI + KOSDAQ 약 2900개) 은 15회 요청으로 커버된다.
+10초 주기 전수 스캔은 15초당 15건을 소모해 한도 60건의 25% 수준이므로 G7 충족.
+
+  [주의] '전일 시간외 급등' 판정은 시간외 단일가 세션 종료 이후 시점에만
+  유효하다. 따라서 전일 18:10 이후 배치로 필드 36/37/38 을 저장해 두고
+  다음 날 참조하는 방식으로 구현한다 (장중 조회 시 해당 필드는 당일 값이
+  아직 없음).
+
+
+3.7 StockChart 어댑터 상세
+--------------------------
+
+CpSysDib.StockChart 입력
+
+   0 : 종목코드 (string)  - 주식 A005930 형식. 접두 'A' 필수
+   1 : 요청구분 (char)    - '1' 기간 / '2' 개수
+   2 : 요청종료일 (ulong) - YYYYMMDD. 0 = 최근 거래일
+   3 : 요청시작일 (ulong) - YYYYMMDD
+   4 : 요청개수 (ulong)
+   5 : 필드 배열 (long array)
+   6 : 차트구분 (char)    - 'D' 일 / 'W' 주 / 'M' 월 / 'm' 분 / 'T' 틱
+   7 : 주기 (ushort)
+   8 : 갭보정
+   9 : 수정주가
+  10 : 거래량구분
+
+사용 필드
+
+   0  날짜
+   1  시간 (hhmm)
+   2~5 시 / 고 / 저 / 종
+   8  거래량
+   9  거래대금
+  13  시가총액
+  10  누적체결매도수량   (분 / 틱 요청 시에만 제공)
+  11  누적체결매수수량   (분 / 틱 요청 시에만 제공)
+      -> 10, 11 은 위성 전략의 매수우위 지표로 활용
+
+  여기서도 반환 필드는 요청 필드 번호 오름차순 정렬이다.
+
+필수 설정
+
+  9  = '1'   수정주가 사용 (필수)
+             무수정주가로 백테스트하면 액면분할 / 무상증자 종목에서 가짜
+             갭이 신호로 잡혀 성과가 왜곡된다.
+  10 = '3'   시간외거래량 모두 제외
+             일봉 거래대금을 정규장 기준으로 통일. 단 이 설정 시 일봉
+             거래량이 HTS 표시값과 달라질 수 있으므로 한 종목으로 교차
+             검증 [VERIFY]
+
+분봉 페이징
+
+  - 1회 요청당 최대 약 2499개만 회신됨
+  - 1분봉 하루 약 381봉 -> 1회 요청은 약 6.5 거래일치
+  - 60일치 1분봉은 종목당 약 10회 요청 필요
+  - 페이징 방법 : 요청종료일을 앞으로 밀어가며 반복,
+                  중복 구간은 (날짜, 시간) 키로 dedup
+  - 종료 조건   : 수신개수 0 또는 목표 시작일 도달
+
+헤더 17 (종목상태) 은 정상 / 투자위험 / 관리 / 거래정지 / 불성실공시 /
+투자경고 등을 한 값으로 반환한다. 백필 시 이 값을 함께 저장하면 과거 시점의
+종목 상태를 별도 조회 없이 확보할 수 있다.
+
+
+3.8 백필 예산 계산
+------------------
+
+  작업                            요청 수      소요(4req/s)  실행 시점
+  ------------------------------- ------------ ------------- --------------
+  초기 일봉 10년 전종목           2900 x 3     약 36분       최초 1회
+                                  = 8700
+  일봉 일일 증분                  0            4초           매일 15:40
+                                  (MarketEye
+                                   15건 대체)
+  관심 300종목 1분봉 60일         3000         약 13분       최초 + 주말
+  관심 300종목 1분봉 일일 증분    300          약 80초       매일 16:00
+  유니버스 메타 스냅샷            0            즉시          매일 08:30
+
+  [핵심 절약 기법]
+  일봉 증분을 차트 API 대신 MarketEye 전수 스냅샷(필드 5/6/7/4/10/11)으로
+  대체한다. 15:35 이후 스냅샷 1회(15요청)로 전 종목 당일 일봉이 확정되므로,
+  일일 데이터 파이프라인의 Creon 비용이 사실상 0 에 수렴한다.
+
+
+3.9 연결 장애와 상태기계
+------------------------
+
+  INIT -> LOGIN -> READY -> DEGRADED -> RECONNECT -> DEAD
+
+  전이 규칙
+
+  - OnDisConnect 이벤트 수신 또는 IsConnect == 0 관측 시 즉시 RECONNECT
+  - 진행 중인 모든 요청에 E_DISCONNECT 응답
+  - PUB 소켓으로 {"type":"health","state":"RECONNECT"} 브로드캐스트
+  - P2 는 이 신호를 받으면 레짐을 RED 로 강제 전환하고 신규 진입 차단
+    (데이터 없이 전략을 돌리는 것이 가장 위험한 실패 모드)
+  - 재연결 30초 간격 5회 시도 후 실패 시 DEAD 전이 및 운영자 알림
+  - 보유 포지션 청산은 P3(키움)이 독립적으로 수행 가능하므로 P1 장애가
+    청산을 막지 않는다. 이 독립성이 데이터 / 주문 이원화의 가장 큰 이점.
+
+
+--------------------------------------------------------------------------------
+ 4. P2 - 64-bit 운영 코어 설계
+--------------------------------------------------------------------------------
+
+4.1 모듈 구성과 책임
+--------------------
+
+  모듈            책임                                     의존
+  --------------- ---------------------------------------- ----------------
+  creon_client    P1 RPC 클라이언트, 재시도 / 스트림 재조립 zmq, msgpack
+  datahub         Parquet / DuckDB 적재 및 조회, 지표 캐시  pyarrow, duckdb
+  universe        포인트인타임 하드 필터                    datahub
+  regime          Layer 0 레짐 판정                         datahub
+  theme           테마 클러스터링 및 대장주 스코어          datahub
+  strategy_core   Layer 1 종가 오버나이트                   상위 전부
+  strategy_sat    Layer 2 장중 돌파 (반자동)                상위 전부
+  risk            Layer 3 하드락                            journal
+  router          주문 의도 -> P3 전달, 체결 조정           risk
+  journal         모든 이벤트 append-only 기록              duckdb
+  scheduler       시각 기반 잡 트리거                       -
+
+
+4.2 데이터레이크 스키마
+-----------------------
+
+저장 루트 : D:\quant\lake
+포맷      : 전부 Parquet (snappy). DuckDB 는 뷰만 정의하고 원본은 파일로 둔다.
+
+  lake/
+    bars_daily/      year=YYYY/part-000.parquet
+    bars_1m/         date=YYYYMMDD/part-000.parquet
+    snapshots/       date=YYYYMMDD/t=HHMMSS.parquet
+    universe_meta/   date=YYYYMMDD/part-000.parquet
+    theme_map/       date=YYYYMMDD/part-000.parquet
+    index_daily/     part-000.parquet
+    signals/   orders/   fills/   positions/   equity/   regime/
+
+bars_daily   PK (date, code)
+
+    date         DATE
+    code         VARCHAR(7)
+    open         DOUBLE
+    high         DOUBLE
+    low          DOUBLE
+    close        DOUBLE
+    volume       BIGINT
+    value        BIGINT
+    mktcap       BIGINT
+    shares       BIGINT
+    status_code  VARCHAR(2)
+    adj_applied  BOOLEAN
+
+bars_1m      PK (date, code, hhmm)
+
+    date, code, hhmm SMALLINT, open, high, low, close,
+    volume BIGINT, value BIGINT, cum_sell BIGINT, cum_buy BIGINT
+
+snapshots    MarketEye 원본을 필드명 컬럼으로 펼쳐 저장
+
+    date, code, t_capture TIMESTAMP, <27개 필드>
+    실전 재현성 검증과 백테스트 누수 진단에 사용하므로 무손실 보관.
+
+universe_meta   포인트인타임의 핵심
+
+    date, code, name,
+    market          SMALLINT   (1 거래소 / 2 코스닥)
+    section_kind    SMALLINT   (1 주권 / 10 ETF 등)
+    supervision     SMALLINT   (0 일반 / 1 관리)
+    control_kind    SMALLINT   (0 정상 / 1 주의 / 2 경고 /
+                                3 위험예고 / 4 위험)
+    status_kind     SMALLINT   (0 정상 / 1 거래정지 / 2 거래중단)
+    listed_date     DATE
+    margin_rate     DOUBLE
+    meme_min        INT
+    credit_enable   BOOLEAN
+    group_code      VARCHAR
+    is_kospi200     SMALLINT
+
+    컬럼 의미는 CpCodeMgr 의 GetStockMarketKind, GetStockSectionKind,
+    GetStockSupervisionKind, GetStockControlKind, GetStockStatusKind 를
+    그대로 따른다.
+
+signals
+
+    ts, layer, code, grade, score, features JSON,
+    decision VARCHAR, reject_reason VARCHAR
+
+    [중요] 채택되지 않은 신호도 전부 기록한다. 사후에 "왜 안 샀는가" 를
+    재구성할 수 없으면 복기 루프가 작동하지 않는다.
+
+fills
+
+    ts, order_id, code, side, qty, price, fee, tax,
+    slippage_vs_signal, layer
+
+    slippage_vs_signal = 신호 시점 참조가 대비 실체결가 괴리.
+    G-게이트 재검증과 백테스트 비용 가정 캘리브레이션의 입력.
+
+
+4.3 Layer 0 - 레짐 게이트
+-------------------------
+
+판정 시각
+  15:05  당일 반영
+  08:50  전일 확정치로 당일 개시 상태 결정
+
+입력
+  코스피 / 코스닥 지수 일봉 (Creon 업종코드 U001, U201 [VERIFY]),
+  시장 전체 거래대금, 신고가 / 신저가 종목 수, 업종 지수
+
+다섯 개 서브스코어를 각각 {-1, 0, +1} 로 산출
+
+  R1 추세
+      close > MA120 and MA20 > MA60          -> +1
+      close < MA120                          -> -1
+      그 외                                  ->  0
+      (KOSPI / KOSDAQ 각각 계산 후 평균, 반올림)
+
+  R2 시장폭
+      ratio = N(20일 신고가) / max(N(20일 신저가), 1)
+      ratio > 2.0   -> +1
+      ratio < 0.5   -> -1
+      그 외         ->  0
+
+  R3 자금유입
+      value_ma5 / value_ma60
+      > 1.10  -> +1
+      < 0.85  -> -1
+      그 외   ->  0
+
+  R4 주도주 붕괴
+      직전 20일 상승률 1위 업종지수의 60일 고점 대비 낙폭
+      < -12%  -> -1
+      그 외   ->  0
+      (상방 기여 없음 : 비대칭 설계)
+
+  R5 변동성
+      지수 20일 실현변동성의 2년 백분위
+      > 80p  -> -1
+      < 40p  -> +1
+      그 외  ->  0
+
+  regime_score = R1 + R2 + R3 + R4 + R5        범위 [-5, +4]
+
+상태 매핑과 자금 승수
+
+  score >= +2   -> GREEN   승수 1.0
+  score <= -2   -> RED     승수 0.0
+  그 외         -> AMBER   승수 0.4
+
+전이 규칙
+
+  - 히스테리시스 : 2거래일 연속 조건 충족 시에만 상태 변경
+  - RED -> GREEN 직행 금지. 반드시 AMBER 를 1일 이상 경유
+
+  [설계 원칙 - 엄수]
+  레짐 파라미터는 수익률을 목표함수로 최적화하지 않는다. 최적화 목표는
+  MDD 최소화이며, 수익 파라미터 탐색은 Layer 1 에서만 수행한다. 이 분리
+  없이는 5개 지표 x 임계값 조합이 즉시 과최적화 기계가 된다.
+
+
+4.4 Layer 1 - 코어 전략 (종가 오버나이트, 100% 자동)
+----------------------------------------------------
+
+4.4.1 타임라인
+
+  시각          동작
+  ------------- ------------------------------------------------------------
+  08:30         universe.list 스냅샷 -> universe_meta 적재
+  08:50         레짐 판정 (전일 확정) -> 당일 승수 확정
+  09:00~09:05   전일 포지션 청산 로직 실행
+  15:05         레짐 재판정 (당일 반영)
+  15:10         MarketEye 전수 스냅샷 -> 1차 후보 선별
+  15:15         테마 클러스터링 + 대장주 확정 + 최종 랭킹
+  15:20~15:30   종가 단일가 동시호가 주문 제출
+  15:35         체결 확인, 일봉 증분 스냅샷
+  16:00         관심종목 1분봉 증분 백필, 일일 리포트
+  18:15         시간외 단일가 스냅샷 (다음날 금지규칙용)
+
+4.4.2 하드 필터  (전부 AND. 하나라도 실패 시 탈락)
+
+  F01  section_kind == 1                              (주권만)
+  F02  supervision == 0  and  status_kind == 0
+  F03  control_kind <= 1                              (경고 이상 배제)
+  F04  name 에 '스팩', '기업인수' 불포함
+  F05  우선주 배제
+         code[6] not in {'5','7','9','K','L','M'}
+         and name 말미 '우' 아님
+  F06  listed_date <= T - 120 calendar days
+  F07  mktcap = close * shares >= 100_000_000_000     (1000억)
+  F08  adv20 = mean(value[-20:]) >= 10_000_000_000    (100억)
+  F09  1_000 <= close <= 200_000
+  F10  gap_open = open / prev_close - 1 < 0.06        (불개미 금지규칙)
+  F11  prev_afterhours_ret < 0.04                     (불개미 금지규칙)
+  F12  0.04 <= day_ret <= 0.18
+  F13  close < upper_limit * 0.97                     (상한가 근접 배제)
+  F14  당일 거래정지 / VI 이력 없음  (snapshots 로 검증)
+  F15  전일 동일 종목 코어 진입 이력 없음  (1일 1회 제한)
+
+4.4.3 강도 조건과 스코어
+
+  VR = value_today / adv20            >= K         K in {3, 5, 8}      [TBD]
+  RP = (close - low)/(high - low)*100 >= RP_min    RP_min in {50,60,70}[TBD]
+       (high == low 인 경우 탈락)
+  UW = (high - max(open, close)) / (high - low)  <= 0.30
+  MA : close > MA20  and  close > MA60
+  POS: close >= max(high[-20:-1])
+       OR  close >= 0.98 * max(high[-60:-1])
+
+  [15:10 시점 처리 - 실전 / 백테스트 동일 코드 경로 필수]
+    close       -> 당시 현재가 (필드 4) 를 프록시로 사용
+    value_today -> 필드 11 의 15:10 누적값 x (15:10 -> 15:30 누적 계수)
+                   계수는 과거 60일 중위수, 종목별 아님 (시장 평균),
+                   초기값 1.06 [TBD]
+    이 추정 로직은 백테스트와 실전에서 완전히 동일한 코드 경로를 타야 한다
+    (5.3절 / 7.3절 누수 방지).
+
+4.4.4 테마 클러스터링과 대장주 판정
+
+  클러스터 생성 - 세 입력 결합
+    (1) 사전 구축 테마 마스터 (theme_master.yaml, 수동 관리 + 월 1회 갱신)
+    (2) CpCodeMgr.GetStockGroupCode 의 계열사 코드
+    (3) 당일 5분봉 수익률 벡터의 상관계수 행렬에 대한 계층적 클러스터링
+        (상관 >= 0.6, 최소 군집 3)
+
+  클러스터 유효 조건
+    동일 클러스터 내 3종목 이상이 day_ret >= +5% 이고 VR >= 2
+    2종목 이하 동조는 신뢰도 부족으로 간주해 클러스터 전체를 무효화한다.
+    ("세 종목 이상이 함께 오를 때 돈이 몰린다고 판단한다" 원칙의 직역)
+
+  대장주 스코어 - 클러스터 내부에서만 계산하고 1위만 취함
+
+    leader = 0.35 * z(day_ret)
+           + 0.30 * z(value_today / mktcap)        # 회전율
+           + 0.20 * z(-first_touch_minute)         # 먼저 움직인 쪽 가점
+           + 0.15 * z(log(mktcap))
+
+    first_touch_minute = 당일 1분봉에서 +5% 를 처음 상회한 분 (없으면 999)
+
+  예외 규정
+    1위가 상한가 잠김 (close >= upper_limit * 0.995 이고 최우선매도잔량 0)
+    일 때만 2위를 승격한다. 그 외 2위 이하는 전량 폐기.
+
+  solo_allowed 기본값 = false. 테마 미배정 단독 종목은 채택하지 않는다.
+
+4.4.5 최종 랭킹과 사이징
+
+  final = 0.40 * z(VR) + 0.30 * z(RP) + 0.30 * z(leader)
+  선정  = final 상위 N종목 ,  N = 4  (범위 3~5, [TBD])
+
+  risk parity
+    raw_i        = target_vol / ATR20_pct_i          target_vol = 0.02
+    w_i          = raw_i / sum(raw) * gross_target
+    gross_target = 0.60 * regime_mult * consec_penalty
+    w_i          = min(w_i, 0.25)                    # 종목당 상한
+    qty_i        = floor(equity * w_i / price / meme_min) * meme_min
+
+  meme_min 은 CpCodeMgr.GetStockMemeMin 으로 얻은 매매수량단위.
+  레버리지는 0 이며, 주문 시 신용 / 미수 구분 코드를 사용하지 않도록
+  라우터에서 하드 차단한다.
+
+4.4.6 진입 주문 메커니즘  (구현 난이도 높음)
+
+  종가 단일가 동시호가(15:20~15:30)는 단일가 체결이므로, 종가보다 높은
+  지정가 매수는 종가에 체결된다. 따라서 다음 절차를 사용한다.
+
+    15:20  MarketEye 필드 28(예상체결가), 31(예상체결수량) 조회
+           limit_price = round_to_tick(예상체결가 * 1.005)
+           지정가 매수 제출
+    15:26  예상체결가 재조회. limit_price 대비 +0.3% 이상 상승 시
+           정정주문(kt10002)으로 상향
+    15:28  이후 정정 금지
+
+  수량 제약
+    qty_i <= 0.05 * 예상체결수량       초과 시 수량 절삭
+    이 제약이 G8 게이트의 실전 집행이자 백테스트 체결 가정과 대응된다.
+
+  round_to_tick(price, market)
+    시장별 / 가격대별 호가단위 표 사용. 거래소 규정 변경 이력이 있으므로
+    상수 테이블(config/tick_table.yaml)로 분리하고 [VERIFY] 대상으로 둔다.
+
+4.4.7 청산 규칙  (익일, 재량 없음)
+
+  09:00 시가 동시호가 참여로 확정된 시가 기준
+    gap = open / entry_price - 1
+
+    gap >= +0.02       -> 09:00:00 시장가 전량 매도
+    0 <= gap < 0.02    -> 09:00 ~ 09:05 관찰
+                          구간 중 price <= entry_price * 0.99
+                            -> 즉시 전량
+                          그 외 09:05:00 시장가 전량
+    gap < 0            -> 09:00:00 시장가 전량 (손절)
+
+  상시
+    price <= entry_price * 0.96  -> 즉시 전량 (하드 손절 -4%)
+
+  불변 조건
+    오버나이트는 1영업일만. 익일 09:06 이후 잔여 포지션은 존재해서는 안 됨.
+
+  구현 참고
+    시가 동시호가 매도를 08:40~09:00 에 하한가 근처 지정가로 제출해 시가
+    체결을 확보하는 방식이 실무적으로 안전하나, 갭 판정 후 조건 분기를
+    하려면 시가 확정 후 시장가를 내야 한다. 본 설계는 후자를 택하고,
+    09:00:00~09:00:03 의 체결 지연을 슬리피지 가정(0.15%)에 흡수시킨다.
+
+
+4.5 Layer 2 - 위성 전략 (장중 돌파, 반자동)
+-------------------------------------------
+
+  활성 조건 : GREEN 레짐에서만
+  할당 자본 : 총자산의 20% 이내
+  일일 상한 : 최대 3거래
+
+  후보 풀
+    09:05 부터 10초 주기 MarketEye 전수 스캔으로 갱신.
+    조건 : day_ret >= +3%, VR_intraday >= 2, F01~F09 통과
+    결과 : 보통 30~80종목
+
+    이 풀에 대해서만 1분봉을 실시간 파생 계산한다. 스냅샷 차분으로 분봉을
+    자체 합성하면 Creon 차트 요청을 소모하지 않는다
+    (10초 스냅샷 6개 = 1분봉 1개).
+
+  신호 조건
+
+    MV   = value_1m / mean(같은 분 시각의 value, 최근 20거래일)
+           >= 5                                                     [TBD]
+    BRK  = close_1m > max(당일 이전 봉들의 high_1m) + 1 tick
+    CONF = 돌파 후 3분 내 low_1m >= breakout_line
+           AND 이후 봉이 돌파봉 high 상회
+    CLU  = 테마 클러스터 3종목 이상 동조 AND 대장주 rank1
+    STR  = 체결강도 >= 120
+           AND (최우선매수잔량 / 최우선매도잔량) >= 1.2
+    TIME = hhmm in [0910, 1100] U [1300, 1430]
+
+  [G6 통과의 핵심]
+  CONF (돌파 후 눌림 지지 확인) 를 필수 조건으로 둔다. 돌파 순간 체결을
+  포기하는 대가로 신호 확정까지 수 분의 여유가 생기고, 사람의 승인 시간과
+  개인용 API 의 지연이 예산 안에 들어온다.
+
+  등급
+    A : 전 조건 충족 + MV >= 8
+    B : 전 조건 충족
+    C : CONF 미충족
+
+    A 만 승인 대기열에 올린다. ops_ui 에 알림이 뜨고 60초 내 승인이 없으면
+    신호는 자동 폐기. 승인 시 router 가 지정가(현재가 +0.3%)로 제출하고
+    미체결분은 30초 후 취소 (IOC 아님).
+
+  청산
+    돌파선 -0.7%        손절
+    +3%                 절반 익절
+    잔량                3분봉 저점 추적 손절
+    14:50               강제 전량 청산
+    오버나이트 보유 금지
+
+
+4.6 데이터 / 주문 이원화 정합성 처리
+------------------------------------
+
+  종목코드 표기 차이
+    Creon : A005930
+    키움  : 005930
+
+    변환은 datahub 경계에서 단일 함수로만 수행한다. 레이크 내부 표준은
+    접두 없는 6자리 + 확장 여유 1자리로 통일.
+
+  가격 정합성 검증 잡 (매일 15:40)
+    전 보유 종목에 대해 Creon 스냅샷 종가와 키움 실시간(0B) 마지막
+    체결가를 비교. 괴리가 0.1% 초과 시 경보 발생 + 해당 종목의 익일 신규
+    진입 차단.
+
+    두 소스가 다른 값을 말할 때 주문을 내는 것은 가장 조용하고 치명적인
+    실패 모드이다.
+
+  시각 동기화
+    로컬 클럭을 NTP 에 동기.
+    MarketEye 필드 1(시간, hhmm)은 분 단위 해상도이므로 지연 측정 기준으로
+    사용하지 않는다. 모든 지연 예산 측정은 로컬 단조 시계
+    (time.monotonic) 로 수행한다.
+
+
+--------------------------------------------------------------------------------
+ 5. P3 - 키움 주문 게이트웨이
+--------------------------------------------------------------------------------
+
+키움 REST API 는 계좌(토큰)별 초당 50회 한도이며, 조건검색 관련은 분당 5회
+수준으로 별도 제한된다 (최신 유량 정책은 키움 공지에서 구현 시점에 재확인).
+
+  [설계 결정] 본 시스템은 조건검색 API 를 사용하지 않는다.
+  스크리닝은 전부 Creon 데이터로 자체 수행하므로 가장 엄격한 유량 제약을
+  처음부터 회피한다. 이것이 브리지 도입의 가장 큰 실익이다.
+
+사용 엔드포인트
+
+  kt10000  매수
+  kt10001  매도
+  kt10002  정정
+  kt10003  취소
+
+실시간 (WebSocket)
+
+  0B  주식체결
+  0D  주식호가
+
+토큰 관리
+
+  발급 후 만료 10분 전 자동 갱신. 갱신 실패 시 신규 주문 차단 후
+  청산 전용 모드로 전환.
+
+주문 상태기계
+
+  INTENT -> SUBMITTED -> ACKED -> (PARTIAL)
+         -> FILLED | CANCELED | REJECTED | ORPHAN
+
+  ORPHAN 은 제출했으나 응답을 못 받은 상태로, 반드시 계좌 조회로 실재
+  여부를 확인해야 한다.
+
+  [필수 규칙] 네트워크 타임아웃 시 재시도 전에 조회를 먼저 한다.
+  이 규칙을 강제하지 않으면 중복 주문이 발생한다.
+
+  모든 주문에 클라이언트 생성 intent_id 를 부여해 멱등성 키로 사용하고,
+  동일 intent_id 의 재제출을 로컬에서 차단한다.
+
+
+--------------------------------------------------------------------------------
+ 6. Layer 3 - 리스크 오버레이 (하드락)
+--------------------------------------------------------------------------------
+
+risk 모듈은 router 의 유일한 상위 관문이며, 어떤 전략 코드도 이를 우회하는
+경로를 가져서는 안 된다. 아키텍처적으로 router.submit() 은
+risk.authorize(intent) 가 반환한 토큰 없이는 호출 불가한 시그니처로 설계한다.
+
+  규칙                  임계값                       발동 시 동작
+  --------------------- ---------------------------- ------------------------
+  일일 손실 한도        -3.0%                        당일 신규 진입 전면
+                                                     차단 (청산은 허용)
+  주간 손실 한도        -6.0%                        주말까지 신규 진입 차단
+  월간 손실 한도        -10.0%                       킬스위치. 시스템 정지,
+                                                     수동 재가동만 허용
+  연속 손실             3회                          이후 5거래 사이즈 x0.5
+  최대 보유 종목        5                            초과 주문 거부
+  종목당 비중           25%                          수량 절삭
+  총 익스포저           60%                          수량 절삭
+  레버리지              0                            신용 / 미수 주문구분
+                                                     사용 차단
+  단일 주문 수량        min(당일거래대금 x 0.5%,     수량 절삭
+                        adv20 x 0.5%) / 가격
+  지정가 편차           현재가 +-3%                  주문 거부
+  초당 주문 수          3                            큐잉
+  일일 취소율           30%                          초과 시 당일 신규 주문
+                                                     차단
+  동일 종목 재진입      1일 1회                      주문 거부
+
+  일일 취소율 상한은 수익이 아니라 시장감시 리스크 관리를 위한 규칙이다.
+  알고리즘 매매는 감시 대상이며, 과도한 정정 / 취소 패턴은 그 자체로 문제가
+  될 수 있다. 본 시스템은 코어 기준 일 4~8건 수준의 저빈도이므로 구조적으로
+  여유가 있다.
+
+
+--------------------------------------------------------------------------------
+ 7. 백테스트 엔진 설계
+--------------------------------------------------------------------------------
+
+7.1 구조
+--------
+
+이벤트 드리븐 루프이며 실전 코드와 전략 모듈을 물리적으로 공유한다.
+strategy_core.evaluate(ctx) 는 ctx 가 실전 DataHub 인지 백테스트 DataHub
+인지 알지 못하도록 인터페이스를 통일한다.
+
+  전략 로직을 백테스트용으로 따로 쓰면 두 코드가 반드시 갈라지고 검증은
+  무의미해진다.
+
+7.2 비용 모델
+-------------
+
+2026-01-01 부터 증권거래세율이 환원되어
+  코스피 : 거래세 0.05% + 농어촌특별세 0.15% = 0.20%
+  코스닥 : 0.20%
+  코넥스 : 0.1% 유지
+
+기본 비용 파라미터
+
+  tax_sell          = 0.0020     # 시장 무관 0.2% (2026 기준, 설정값)
+  fee_buy           = 0.00015    # 증권사별 조정
+  fee_sell          = 0.00015
+  slip_buy          = 0.0015
+  slip_sell         = 0.0015
+  round_trip_cost   = 0.0035 ~ 0.0050
+  stress_multiplier = 2.0        # G4 게이트용
+
+  [전략 설계를 지배하는 사실]
+  왕복비용 0.35~0.50% 라는 값이 전략 설계 전체를 지배한다. G3 게이트
+  (거래당 평균 총수익 >= 왕복비용 x 1.5) 는 거래당 평균 0.5~0.75% 이상의
+  총수익을 요구하며, 이것이 하루 38종목 회전형 스캘핑을 구조적으로 배제한
+  근거이다.
+
+7.3 미래정보 누수 방지  (가장 중요)
+-----------------------------------
+
+코어 전략은 종가에 진입하므로 "종가 확정값으로 종목을 고른 뒤 그 종가에
+산다" 는 순환 논리에 빠지기 쉽다. 이를 막기 위해 백테스트는 두 모드를
+항상 동시 산출한다.
+
+  모드 A (Optimistic / 진단용)
+    일봉 확정값(종가, 당일 거래대금)으로 선정하고 종가에 진입.
+    구현이 쉬우나 실전 불가능.
+
+  모드 B (Realistic / 공식 성과)
+    1분봉을 15:10 까지 누적해 당시 시점 값만으로 선정.
+      close       = 15:10 현재가
+      value_today = 15:10 누적 거래대금 x 보정계수
+      high / low  = 15:10 까지의 값
+    진입가는 실제 종가 (동시호가 단일가 체결이므로 타당).
+
+  [판정] B / A 성과비가 0.7 미만이면 전략은 사실상 종가 확정값에 의존하고
+  있다는 뜻이며 폐기 대상이다. 이 진단을 생략하면 실전에서 성과가 절반으로
+  떨어지는 원인을 영원히 찾지 못한다.
+
+7.4 체결 가능성 모델
+--------------------
+
+  코어 진입 : min(목표수량, 당일 거래량 x participation_close)
+              participation_close = 0.03  [TBD]
+              (종가 동시호가 거래량을 일 거래량의 일부로 보는 프록시)
+  청산      : min(보유수량, 시가 거래량 x 0.05)
+              미체결분은 다음 분봉으로 이월
+
+  부분체결이 발생하는 종목 비중이 10% 를 넘으면 유동성 하한(F08)을
+  상향해야 한다는 신호이다.
+
+7.5 생존편향과 검증 프로토콜
+----------------------------
+
+  유니버스
+    매 시점 universe_meta 를 날짜로 조인해 구성. 상장폐지 / 거래정지
+    종목을 데이터에서 제거하지 않는다. 상장폐지 종목은 마지막 거래일
+    종가 기준 -100% 또는 정리매매 실제가로 처리 (보수적으로 -70% 고정
+    가정도 허용, 설정값).
+
+  워크포워드
+    학습 24개월 / 검증 6개월 / 롤 6개월, 2016년 이후 전 구간 커버.
+
+  파라미터 그리드 (총 729조합)
+    K            in {3, 5, 8}
+    RP_min       in {50, 60, 70}
+    day_ret 상한 in {0.15, 0.18, 0.22}
+    N            in {3, 4, 5}
+    stop         in {-0.03, -0.04, -0.05}
+    amber_mult   in {0.3, 0.4, 0.5}
+
+    200조합 이하 권고를 초과하므로 2단계 탐색으로 분할한다.
+      1단계 : K, RP_min, N 만 27조합
+      2단계 : 나머지
+
+  채택 기준 - 최적값이 아니라 평탄성
+    상위 조합의 성과가 파라미터 공간에서 고원(plateau)을 형성해야 한다.
+    인접 조합에서 Sharpe 가 30% 이상 급락하는 절벽(cliff)이면 과최적화로
+    판정해 폐기한다.
+
+  리포트 필수 포함 항목
+    전체 성과, 레짐별(Green/Amber/Red) 분해, 연도별 분해, 월별 히트맵,
+    거래당 수익 분포, 실제 슬리피지 대비 가정 검증, 부트스트랩 ROR.
+
+    특정 레짐 하나가 전체 수익의 80% 를 초과 생성하면 그 레짐 판정의
+    견고성을 별도 민감도 분석으로 검증한다.
+
+
+--------------------------------------------------------------------------------
+ 8. 설정 파일 명세  config/system.yaml
+--------------------------------------------------------------------------------
+
+meta:
+  version: "1.0"
+  mode: "backtest"            # backtest | paper | live_small | live
+
+bridge:
+  rpc_addr: "tcp://127.0.0.1:5561"
+  pub_addr: "tcp://127.0.0.1:5562"
+  rpc_timeout_ms: 5000
+  retry: {max: 3, backoff_ms: [200, 600, 1800]}
+  max_frame_bytes: 8388608
+
+creon:
+  quote_limit:
+    count: 60
+    window_ms: 15000
+    safety_margin: 8
+    client_cap: 52
+  marketeye:
+    max_codes: 200
+    max_fields: 64
+    fields: [0,2,3,4,5,6,7,10,11,12,13,14,15,16,20,22,23,24,28,31,
+             33,34,35,36,37,38,63,64,116,118,120]
+  chart:
+    minute_max_per_req: 2499
+    adjusted: "1"             # 수정주가 필수
+    volume_kind: "3"          # 시간외 제외
+  index_codes: {kospi: "U001", kosdaq: "U201"}      # VERIFY
+
+kiwoom:
+  rest_base: "https://api.kiwoom.com"               # VERIFY
+  rate: {per_sec: 40}                               # 공식 50 대비 80%
+  use_condition_search: false                       # 의도적 미사용
+  order_ids:
+    buy: "kt10000"
+    sell: "kt10001"
+    modify: "kt10002"
+    cancel: "kt10003"
+  realtime: ["0B", "0D"]
+
+regime:
+  eval_times: ["08:50", "15:05"]
+  thresholds: {green: 2, red: -2}
+  multipliers: {GREEN: 1.0, AMBER: 0.4, RED: 0.0}
+  hysteresis_days: 2
+  forbid_red_to_green: true
+
+core:
+  enabled: true
+  scan_time: "15:10"
+  order_window: ["15:20", "15:28"]
+  filters:
+    min_mktcap: 100000000000
+    min_adv20: 10000000000
+    price_range: [1000, 200000]
+    max_gap_open: 0.06
+    max_prev_afterhours_ret: 0.04
+    day_ret_range: [0.04, 0.18]
+    upper_limit_buffer: 0.97
+    min_listed_days: 120
+  strength: {vr_k: 5, rp_min: 60, max_upper_wick: 0.30}
+  theme:
+    min_members: 3
+    member_ret: 0.05
+    member_vr: 2.0
+    solo_allowed: false
+  ranking:
+    weights: {vr: 0.40, rp: 0.30, leader: 0.30}
+    n_positions: 4
+  sizing: {target_vol: 0.02, gross_target: 0.60, max_weight: 0.25}
+  entry:
+    limit_premium: 0.005
+    repricing_trigger: 0.003
+    max_pct_of_expected_qty: 0.05
+  exit:
+    gap_strong: 0.02
+    observe_until: "09:05"
+    observe_stop: -0.01
+    hard_stop: -0.04
+  intraday_value_extrap: 1.06     # 15:10 -> 15:30 누적 보정계수, TBD
+
+satellite:
+  enabled: true
+  require_regime: ["GREEN"]
+  capital_share: 0.20
+  max_trades_per_day: 3
+  scan_interval_sec: 10
+  windows: [["09:10","11:00"], ["13:00","14:30"]]
+  signal: {mv_ratio: 5.0, strength_min: 120, bid_ask_ratio: 1.2}
+  require_pullback_confirm: true
+  grades_to_notify: ["A"]
+  approval_timeout_sec: 60
+  exit:
+    stop_from_line: -0.007
+    tp1: 0.03
+    tp1_ratio: 0.5
+    force_close: "14:50"
+
+risk:
+  daily_loss_limit: -0.03
+  weekly_loss_limit: -0.06
+  monthly_loss_limit: -0.10
+  consecutive_loss: {count: 3, size_mult: 0.5, trades: 5}
+  max_positions: 5
+  max_gross: 0.60
+  leverage_allowed: false
+  max_order_pct_of_value: 0.005
+  limit_deviation: 0.03
+  orders_per_sec: 3
+  daily_cancel_rate: 0.30
+  reentry_same_day: false
+
+costs:
+  tax_sell: 0.0020
+  fee_buy: 0.00015
+  fee_sell: 0.00015
+  slip_buy: 0.0015
+  slip_sell: 0.0015
+  stress_multiplier: 2.0
+
+backtest:
+  start: "2016-01-01"
+  modes: ["A", "B"]
+  official_mode: "B"
+  min_ba_ratio: 0.70
+  walkforward: {train_months: 24, test_months: 6, roll_months: 6}
+  participation_close: 0.03
+  participation_open: 0.05
+  delisting_return: -0.70
+  bootstrap: {n: 10000, ruin_level: -0.50}
+
+gates:
+  sharpe_min: 1.0
+  mdd_max: 0.15
+  edge_over_cost: 1.5
+  ror_max: 0.01
+  oos_is_min: 0.60
+  creon_usage_max: 0.70
+
+
+--------------------------------------------------------------------------------
+ 9. 디렉터리 구조와 파일별 책임
+--------------------------------------------------------------------------------
+
+quant/
+|
++-- config/
+|     system.yaml            전체 설정
+|     theme_master.yaml      테마 마스터 (수동 관리)
+|     tick_table.yaml        호가단위 표
+|     secrets.env            키움 앱키 등
+|
++-- creon32/                 Python 3.11 32-bit venv 전용
+|     server.py              ZMQ ROUTER/PUB, 메인 루프, 상태기계
+|     com_session.py         CoInitialize, 객체 생성, IsConnect/ServerType
+|     rate_governor.py       이중 방어 거버너
+|     job_queue.py           우선순위 큐 + 선점 양보
+|     ad_marketeye.py        필드 오름차순 정렬 맵 + 200 분할
+|     ad_stockchart.py       2499 페이징 + dedup
+|     ad_codemgr.py          유니버스 메타 (요청 비용 0)
+|     ad_stockcur.py         실시간 구독 -> PUB
+|     codec.py               msgpack + 청크 스트리밍
+|
++-- core64/
+|     creon_client.py        P1 RPC 클라이언트
+|     datahub.py             레이크 적재 / 조회
+|     universe.py            포인트인타임 하드 필터
+|     regime.py              Layer 0
+|     theme.py               클러스터링 / 대장주
+|     strategy_core.py       Layer 1
+|     strategy_sat.py        Layer 2
+|     risk.py                Layer 3 하드락
+|     router.py              주문 라우팅
+|     journal.py             이벤트 기록
+|     scheduler.py           시각 트리거
+|     main.py
+|
++-- gw64/
+|     kiwoom_rest.py         주문 REST
+|     kiwoom_ws.py           실시간 WebSocket
+|     order_fsm.py           주문 상태기계
+|     token.py               토큰 관리
+|     main.py
+|
++-- bt/
+|     engine.py              이벤트 루프
+|     costs.py               비용 모델
+|     fill_model.py          체결 모델
+|     walkforward.py         WF 검증
+|     report.py              리포트 생성
+|
++-- ops/
+|     app.py                 Streamlit UI
+|     alerts.py              알림
+|     reconcile.py           정합성 검증 잡
+|
++-- tests/
+|     t01_rate.py ... t12_gate.py
+|
++-- lake/                    7.2 스키마
+
+
+--------------------------------------------------------------------------------
+ 10. 핵심 인터페이스 계약
+--------------------------------------------------------------------------------
+
+creon_client.py
+
+    def call(method: str, params: dict, prio: int = 3,
+             timeout_ms: int = 5000) -> dict
+        # raises BridgeError
+
+    def marketeye(codes: list[str], fields: list[int] | None = None,
+                  prio: int = 0) -> DataFrame
+        # index = code
+
+    def chart_daily(code: str, count: int = 300,
+                    adjusted: bool = True) -> DataFrame
+
+    def chart_minute(code: str, period: int = 1,
+                     count: int = 2499) -> DataFrame
+
+    def stream() -> Iterator[dict]
+        # PUB 구독 제너레이터
+
+regime.py
+
+    def evaluate(asof: date) -> RegimeResult
+
+    RegimeResult(
+        state      : "GREEN" | "AMBER" | "RED",
+        score      : int,
+        subs       : dict[str, int],
+        multiplier : float,
+        raw        : dict
+    )
+
+strategy_core.py
+
+    def scan(ctx: Context, asof: datetime) -> list[Candidate]
+    def rank(cands: list[Candidate], ctx: Context) -> list[Candidate]
+    def size(ranked: list[Candidate], equity: float,
+             regime: RegimeResult, ctx: Context) -> list[OrderIntent]
+    def exit_plan(pos: Position, ctx: Context,
+                  now: datetime) -> ExitAction | None
+
+risk.py
+
+    def authorize(intent: OrderIntent,
+                  state: PortfolioState) -> AuthToken | Rejection
+        # 유일한 주문 관문
+    def on_fill(fill: Fill) -> None
+    def kill_switch_active() -> bool
+
+router.py
+
+    def submit(intent: OrderIntent, token: AuthToken) -> OrderId
+    def cancel(order_id: OrderId) -> bool
+    def reconcile() -> ReconcileReport
+        # ORPHAN 해소
+
+bt/engine.py
+
+    def run(cfg: dict, mode: "A" | "B") -> BacktestResult
+    def walkforward(cfg: dict) -> WalkForwardResult
+
+
+--------------------------------------------------------------------------------
+ 11. 수락 테스트 목록
+--------------------------------------------------------------------------------
+
+  ID   검증 내용              통과 조건
+  ---- ---------------------- ---------------------------------------------
+  T01  Rate Governor 부하     1시간 연속 호출 시 요청 제한 발생 0회,
+                              피크 사용률 <= 70%
+  T02  MarketEye 필드 정렬    무작위 순서 필드 요청 시 값 일치
+                              (HTS 7059 화면 대조)
+  T03  분봉 페이징            60일 1분봉 봉 수 = 거래일수 x 381 +-5,
+                              중복 0
+  T04  수정주가               액면분할 종목의 분할 전후 연속성 확인
+  T05  유니버스 PIT           임의 과거일 유니버스에 당시 미상장 / 폐지
+                              종목 미포함
+  T06  누수 진단              모드 B/A 성과비 >= 0.70
+  T07  비용 민감도            비용 x2 에서 CAGR > 0  (G4)
+  T08  레짐 분해              G/A/R 각 구간 MDD <= 20%  (G10)
+  T09  워크포워드             OOS / IS >= 0.60  (G11)
+  T10  리스크 하드락          한도 초과 주문 100건 시도 -> 통과 0건
+  T11  장애 주입              P1 강제 종료 시 P2 가 5초 내 RED 전환,
+                              청산 경로 정상
+  T12  멱등성                 동일 intent_id 중복 제출 100회 -> 실주문 1건
+
+
+--------------------------------------------------------------------------------
+ 12. 구현 순서 (스프린트)
+--------------------------------------------------------------------------------
+
+1주차 - P1 골격
+  com_session, rate_governor, ad_codemgr, health.status 만 만들고
+  T01 을 통과시킨다.
+  거버너를 나중에 붙이면 개발 중에 요청 제한에 걸려 하루를 날린다.
+
+2주차 - 데이터 파이프라인
+  ad_marketeye, ad_stockchart, creon_client, datahub 완성.
+  T02 ~ T05 통과 후 일봉 10년 + 관심 300종목 1분봉 60일 백필 완료.
+
+3~4주차 - 백테스트 엔진과 코어 전략
+  regime, theme, strategy_core, bt/engine 구현. T06 ~ T09 실행.
+
+  [게이트] 이 단계에서 게이트를 통과하지 못하면 이후 스프린트를 진행하지
+  않고 전략 가정을 재검토한다. 주문 게이트웨이를 먼저 만들고 나중에
+  전략이 안 된다는 걸 알게 되는 것이 가장 흔한 실패 경로이다.
+
+5주차 - P3 와 리스크
+  kiwoom_rest, order_fsm, risk, router 구현.
+  T10 ~ T12 통과 후 모의투자 전환.
+
+6주차 이후 - 위성 전략, 운영 UI, 단계적 롤아웃
+  모의투자 2개월 -> 소액 실전 3개월 -> 점진 증액.
+  각 단계에서 실현 성과가 백테스트의 몇 % 인지 기록하고, 50% 미만이면
+  증액하지 않고 원인 분석으로 회귀한다.
+
+
+--------------------------------------------------------------------------------
+ 13. 브리지 도입으로 변한 것과 새로 생긴 것
+--------------------------------------------------------------------------------
+
+해소된 제약
+
+  1) 전 종목 스크리닝이 200종목 배치 15회로 가능해져 키움 조건검색
+     (분당 5회) 의존이 사라졌다.
+  2) 일봉 증분이 MarketEye 스냅샷으로 대체되어 차트 API 비용이 사실상
+     0 이 되었다.
+  3) 데이터 장애와 주문 장애가 서로 독립되어 P1 이 죽어도 청산이 가능하다.
+
+새로 생긴 제약
+
+  1) 32비트 COM 단일 스레드라는 직렬화 병목이 있어 모든 조회가
+     15초 / 60건 예산을 공유한다.
+  2) Creon 은 매일 재로그인이 필요해 자동 로그인 실패가 곧 당일 시스템
+     중단이다. 08:00 기동 후 08:30 헬스체크 실패 시 운영자 알림이 필수.
+  3) 데이터와 주문이 다른 증권사를 통과하므로 가격 / 종목코드 정합성
+     검증 잡(4.6절)이 없으면 두 소스 불일치가 조용히 손실로 전환된다.
+
+
+--------------------------------------------------------------------------------
+ 14. 유의사항
+--------------------------------------------------------------------------------
+
+본 설계는 대회 우승자들의 수익률을 재현하지 않으며, 재현을 목표로 삼으면
+레버리지 제약(G5)과 비용 제약(G3)이 즉시 깨진다. 816% 나 317% 같은 기록은
+소액 계좌, 최대 레버리지, 특정 국면, 수만 명 중 1등이라는 생존편향이
+곱해진 값이다. 시스템화의 가치는 그 수익률이 아니라 대장주 / 거래대금이라는
+신호 선별 기준, 금지 규칙의 기계적 준수, 확신도에 따른 비중 차등을 사람의
+컨디션과 무관하게 반복 실행하는 데 있다.
+
+VERIFY 항목 정리
+
+  1) Creon 업종 지수 코드 (U001 / U201)
+  2) Creon 자동 로그인 커맨드라인 인자 형식
+  3) 거래량구분 '3' 설정 시 일봉 거래대금의 HTS 대조
+  4) 호가단위 테이블 최신값
+  5) 키움 REST 유량 정책 최신 공지 및 엔드포인트 베이스 URL
+  6) 증권거래세율 (2026년 이후 변경 가능)
+  7) Python 3.11 32-bit + pywin32 조합의 COM 안정성
+
+  이들은 구현 첫날 실환경에서 확인하고 본 문서에 갱신 이력으로 남긴다.
+
+면책
+
+  본 문서는 공개 자료 조사와 시스템 설계 관점의 기술 문서이며 투자자문이
+  아니다. 게이트 통과 여부는 보증된 것이 아니라 직접 백테스트로 확인해야
+  하는 가설이다. 특히 3절의 API 사양은 공식 문서 기준이지만 버전에 따라
+  달라질 수 있다. 착수 시 2~4주 스프린트(데이터 파이프라인 + 코어
+  백테스트)까지 진행해 T06(모드 B/A 비율)과 G3(거래당 수익 대비 비용)을
+  먼저 확인하는 것이 가장 빠르고 값싼 진단이 된다.
+
+================================================================================
+ 문서 끝  (QT-SDD-001 v1.0)
+================================================================================
