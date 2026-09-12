@@ -1,0 +1,149 @@
+meta:
+  version: "1.0"
+  mode: "backtest"            # backtest | paper | live_small | live
+
+bridge:
+  rpc_addr: "tcp://127.0.0.1:5561"
+  pub_addr: "tcp://127.0.0.1:5562"
+  rpc_timeout_ms: 5000
+  retry: {max: 3, backoff_ms: [200, 600, 1800]}
+  max_frame_bytes: 8388608
+
+creon:
+  quote_limit:
+    count: 60
+    window_ms: 15000
+    safety_margin: 8
+    client_cap: 52
+  marketeye:
+    max_codes: 200
+    max_fields: 64
+    # V-C17 CLOSED 전까지 36/37/38 제외: 실제 요청 41개
+    fields: [0,2,3,4,5,6,7,10,11,12,13,14,15,16,20,22,23,24,28,31,
+             32,33,34,35,63,64,84,85,116,118,120,
+             153,154,158,159,160,161,162,163,164,165]
+    fields_pending_vc17: [36,37,38]  # V-C17 CLOSED 후 의미 검증을 거쳐 fields로 승격
+  chart:
+    minute_max_per_req: 2499
+    adjusted: "1"             # 입력 9 수정주가 필수
+    volume_kind: "3"          # 입력 10 시간외 제외
+    early_apply: "N"          # 입력 11 09:00 기준 분봉 주기 (INV-08)
+    exchange_kind: "A"        # 입력 12 KRX+NXT 전체 (INV-08)
+    krx_query_kind: "2"       # 입력 13 정규장만 (INV-08, 2026-09-14)
+    krx_query_kind_afterhours: "1"  # F11 애프터종가 조회 시에만 사용 (3.6)
+  index_codes: {kospi: "U001", kosdaq: "U201"}      # VERIFY
+
+kiwoom:
+  rest_base: "https://api.kiwoom.com"               # VERIFY
+  rate: {per_sec: 40}                               # 공식 50 대비 80%
+  use_condition_search: false                       # 의도적 미사용
+  order_ids:
+    buy: "kt10000"
+    sell: "kt10001"
+    modify: "kt10002"
+    cancel: "kt10003"
+  realtime: ["0B", "0D"]
+
+regime:
+  eval_times: ["08:50", "15:05"]
+  thresholds: {green: 2, red: -2}
+  multipliers: {GREEN: 1.0, AMBER: 0.4, RED: 0.0}
+  hysteresis_days: 2
+  forbid_red_to_green: true
+
+core:
+  enabled: true
+  scan_time: "15:10"
+  order_window: ["15:20", "15:28"]
+  filters:
+    min_mktcap: 100000000000
+    min_adv20: 10000000000
+    price_range: [1000, 200000]
+    max_gap_open: 0.06
+    max_prev_afterhours_ret: 0.04  # TBD-F11: 신규 레짐 60거래일 확보 후 분포 재추정
+    day_ret_range: [0.04, 0.18]
+    upper_limit_buffer: 0.97
+    min_listed_trading_days: 60
+  strength: {vr_k: 5, rp_min: 60, max_upper_wick: 0.30}
+  theme:
+    min_members: 3
+    member_ret: 0.05
+    member_vr: 2.0
+    solo_allowed: false
+  ranking:
+    weights: {vr: 0.40, rp: 0.30, leader: 0.30}
+    n_positions: 4
+  sizing: {target_vol: 0.02, gross_target: 0.60, max_weight: 0.25}
+  f11_transition:
+    effective_from: "2026-09-14"
+    snapshot_time: "20:05"
+    min_reestimate_trading_days: 60
+    sizing_mult: 0.50  # TBD-F11 재추정 완료 전 적용
+  entry:
+    limit_premium: 0.005
+    repricing_trigger: 0.003
+    max_pct_of_expected_qty: 0.05
+  exit:
+    gap_strong: 0.02
+    observe_until: "09:05"
+    observe_stop: -0.01
+    hard_stop: -0.04
+  intraday_value_extrap: 1.06     # 15:10 -> 15:30 누적 보정계수, TBD
+
+satellite:
+  enabled: true
+  require_regime: ["GREEN"]
+  capital_share: 0.20
+  max_trades_per_day: 3
+  scan_interval_sec: 10
+  windows: [["09:10","11:00"], ["13:00","14:30"]]
+  signal: {mv_ratio: 5.0, strength_min: 120, bid_ask_ratio: 1.2}
+  require_pullback_confirm: true
+  grades_to_notify: ["A"]
+  approval_timeout_sec: 60
+  exit:
+    stop_from_line: -0.007
+    tp1: 0.03
+    tp1_ratio: 0.5
+    force_close: "14:50"
+
+risk:
+  daily_loss_limit: -0.03
+  weekly_loss_limit: -0.06
+  monthly_loss_limit: -0.10
+  consecutive_loss: {count: 3, size_mult: 0.5, trades: 5}
+  max_positions: 5
+  max_gross: 0.60
+  leverage_allowed: false
+  max_order_pct_of_value: 0.005
+  limit_deviation: 0.03
+  orders_per_sec: 3
+  daily_cancel_rate: 0.30
+  reentry_same_day: false
+
+costs:
+  tax_sell: 0.0020
+  fee_buy: 0.00015
+  fee_sell: 0.00015
+  slip_buy: 0.0015
+  slip_sell: 0.0015
+  stress_multiplier: 2.0
+
+backtest:
+  start: "2016-01-01"
+  modes: ["A", "B"]
+  official_mode: "B"
+  min_ba_ratio: 0.70
+  walkforward: {train_months: 24, test_months: 6, roll_months: 6}
+  participation_close: 0.03
+  participation_open: 0.05
+  delisting_return: -0.70
+  bootstrap: {n: 10000, ruin_level: -0.50}
+
+gates:
+  sharpe_min: 1.0
+  mdd_max: 0.15
+  edge_over_cost: 1.5
+  ror_max: 0.01
+  oos_is_min: 0.60
+  creon_usage_max: 0.70

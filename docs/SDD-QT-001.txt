@@ -456,6 +456,15 @@ CpSysDib.StockChart 입력
              거래량이 HTS 표시값과 달라질 수 있으므로 한 종목으로 교차
              검증 [VERIFY]
 
+ad_stockchart.py 기동 검증 계약
+  creon.chart의 early_apply / exchange_kind / krx_query_kind /
+  krx_query_kind_afterhours 네 키는 모두 필수다. 하나라도 누락·null·빈값이거나
+  각각 문자열 N / A / 2 / 1과 다르면 COM 생성·조회 전에 기동을 중단한다.
+  adjusted / volume_kind도 각각 문자열 1 / 3을 검증한다.
+  get(key, default) 등 기본값 폴백 금지. 오류에 누락/불일치 키를 명시한다.
+  입력 11/12/13을 매 요청마다 명시하고 F11 조회 후 정규장 설정을 복원한다.
+  fields_pending_vc17은 활성 fields에 자동 병합하지 않는다.
+
 분봉 페이징
 
   - 1회 요청당 최대 약 2499개만 회신됨
@@ -828,6 +837,10 @@ fills
 
   상시
     price <= entry_price * 0.96  -> 즉시 전량 (하드 손절 -4%)
+    애프터마켓 구간(통상 16:00~20:00)에 발동하면 시장가 대신
+    최유리지정가로 전송한다(INV-18). 세션 판정은 매 거래일 종목별
+    GetNewMarketEndTime(code) 조회값을 기준으로 하며 시각을 하드코딩하지 않는다.
+    최유리지정가 전송도 기존 리스크 승인·주문 라우터를 경유한다.
 
   불변 조건
     오버나이트는 1영업일만. 익일 09:06 이후 잔여 포지션은 존재해서는 안 됨.
@@ -1125,12 +1138,19 @@ creon:
   marketeye:
     max_codes: 200
     max_fields: 64
+    # V-C17 CLOSED 전까지 36/37/38 제외: 실제 요청 41개
     fields: [0,2,3,4,5,6,7,10,11,12,13,14,15,16,20,22,23,24,28,31,
-             33,34,35,36,37,38,63,64,116,118,120]
+             32,33,34,35,63,64,84,85,116,118,120,
+             153,154,158,159,160,161,162,163,164,165]
+    fields_pending_vc17: [36,37,38]  # V-C17 CLOSED 후 의미 검증을 거쳐 fields로 승격
   chart:
     minute_max_per_req: 2499
-    adjusted: "1"             # 수정주가 필수
-    volume_kind: "3"          # 시간외 제외
+    adjusted: "1"             # 입력 9 수정주가 필수
+    volume_kind: "3"          # 입력 10 시간외 제외
+    early_apply: "N"          # 입력 11 09:00 기준 분봉 주기 (INV-08)
+    exchange_kind: "A"        # 입력 12 KRX+NXT 전체 (INV-08)
+    krx_query_kind: "2"       # 입력 13 정규장만 (INV-08, 2026-09-14)
+    krx_query_kind_afterhours: "1"  # F11 애프터종가 조회 시에만 사용 (3.6)
   index_codes: {kospi: "U001", kosdaq: "U201"}      # VERIFY
 
 kiwoom:
